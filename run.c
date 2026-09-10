@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#include <arm_neon.h>
 #if defined _WIN32
     #include "win.h"
 #else
@@ -15,6 +16,12 @@
 #endif
 // ----------------------------------------------------------------------------
 // Transformer model
+
+
+// Adding this so I can be sure floats are 4 bytes for some of the optimisations I want to
+// introduce below, I could change data types some other time
+_Static_assert(sizeof(float) == 4, "Error: float is not 4 bytes on this target!");
+
 
 typedef struct {
     int dim; // transformer dimension
@@ -226,6 +233,260 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
+
+    /*
+        -- shape of the matmul --
+
+        w_00.x_0 + w_01.x_1 + w_02.x_2 ... w_0n.x_n
+        w_10.x_0 + w_11.x_1 + w_12.x_2 ... w_1n.x_n
+        w_20.x_0 + w_21.x_1 + w_22.x_2 ... w_2n.x_n
+        .
+        .
+        .
+        w_d0.x_0 + w_d1.x_1 + w_d2.x_2 ... w_dn.x_n
+
+        -- multiply add with SIMD --
+
+          - - - - - - - - - - - - - - - - - - - -
+        | assuming chunk of 4 for now, 
+        | since on my M1 Air the SIMD registers 
+        | are 128bit wide (4 floats))
+          - - - - - - - - - - - - - - - - - - - -
+
+        -- outer_loop -- 
+        initialise the x_row_X_chunk_regiter(s) that will be shared
+        x_row_0_chunk_register
+
+        -- inner loop --
+        w_row_0_chunk_register ->                         w_00    |  w_01    | w_02  | w_03         
+        x_row_0_chunk_register ->                         x_0     |   x_1    |  x_2  | x_3   
+                                                       - - - - - - - - - - - - - - - - - -   
+        sum_accumulator_0      -> sum_accumulator_0 +  w_00.x_0 | w_01.x_1 | w_02.x_2 | w_03.x_3
+
+        w_row_1_chunk_register ->                         w_10    |  w_11    | w_12  | w_13
+        x_row_0_chunk_register ->                         x_0     |   x_1    |  x_2  | x_3 
+                                                       - - - - - - - - - - - - - - - - - - 
+        sum_accumulator_1      -> sum_accumulator_1 +  w_10.x_0 | w_11.x_1 | w_12.x_2 | w_13.x_3
+
+        w_row_2_chunk_register ->                         w_20    |  w_21    | w_22  | w_23
+        x_row_0_chunk_register ->                         x_0     |   x_1    |  x_2  | x_3 
+                                                       - - - - - - - - - - - - - - - - - - 
+        sum_accumulator_2      -> sum_accumulator_2 +  w_20.x_0 | w_21.x_1 | w_22.x_2 | w_23.x_3
+
+        We have 32 SIMD regiters on the M1 air, lets say we want to use up to 28
+            i. Considering load throughput and latency
+            ii. Considering FMA (Fusion Multiply Add/SIMD operations) throughput and latency
+
+        -- Load throughput x latency -- 
+        For each lane of the sum accumulator, we are generally dependent on the W load
+        since we only need to load the x_row_X_chunk_register once
+
+        We can only do three loads in one cycle and the latency of load is about 4 cycles
+        So we can do up to 3 x 4 = 12 loads before stalling 
+        (Not sure this statement is correct, need to think more about it)
+
+
+        28 - 7 = 21
+
+        Loads
+        w_loads   =  3 load
+        sum_loads =  3 load
+                    --------
+                     6 loads
+
+
+
+    */
+    
+    // 16 chunks
+    // we move across the row lockfiles in 1 chunks
+    // I am defining 1 chunk as 4 columns across the row lockstep
+    // since we can only represent 4 floats in a row in one SIMD register
+    // TODO: You can generalise this to be more portable for architectures that can
+    // represent more than 4 floats in a SIMD register
+
+    // TODO: Make sure that data adresses are 64 bytes aligned (size of the cache line)
+
+    
+    float32x4_t sum_w_x_0 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_1 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_2 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_3 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    float32x4_t sum_w_x_4 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_5 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_6 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_7 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    float32x4_t sum_w_x_8 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_9 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_10 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_11 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    float32x4_t sum_w_x_12 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_13 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_14 = {0.0f, 0.0f, 0.0f, 0.0f};
+    float32x4_t sum_w_x_15 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+
+    // j == rows
+    // i == columns
+    for (int j = 0; j < d; j+16) {
+        for (int i = 0; i < n; i+4) {
+            // TODO: Think about prefetching
+            float32x4_t x_chunk = vld1q_f32(&x[i]);
+            
+            float32x4_t w_row_0 = vld1q_f32(&w[((j+0)*n)+i]);
+            sum_w_x_0 = sum_w_x_0 + vmulq_f32(w_row_0, x_chunk);
+
+            float32x4_t w_row_1 = vld1q_f32(&w[((j+1)*n)+i]);
+            sum_w_x_1 = sum_w_x_1 + vmulq_f32(w_row_1, x_chunk);
+
+            float32x4_t w_row_2 = vld1q_f32(&w[((j+2)*n)+i]);
+            sum_w_x_2 = sum_w_x_2 + vmulq_f32(w_row_2, x_chunk);
+
+            float32x4_t w_row_3 = vld1q_f32(&w[((j+3)*n)+i]);
+            sum_w_x_3 = sum_w_x_3 + vmulq_f32(w_row_3, x_chunk);
+
+            float32x4_t w_row_4 = vld1q_f32(&w[((j+4)*n)+i]);
+            sum_w_x_4 = sum_w_x_4 + vmulq_f32(w_row_4, x_chunk);
+
+            float32x4_t w_row_5 = vld1q_f32(&w[((j+5)*n)+i]);
+            sum_w_x_5 = sum_w_x_5 + vmulq_f32(w_row_5, x_chunk);
+
+            float32x4_t w_row_6 = vld1q_f32(&w[((j+6)*n)+i]);
+            sum_w_x_6 = sum_w_x_6 + vmulq_f32(w_row_6, x_chunk);
+
+            float32x4_t w_row_7 = vld1q_f32(&w[((j+7)*n)+i]);
+            sum_w_x_7 = sum_w_x_7 + vmulq_f32(w_row_7, x_chunk);
+
+            float32x4_t w_row_8 = vld1q_f32(&w[((j+8)*n)+i]);
+            sum_w_x_8 = sum_w_x_8 + vmulq_f32(w_row_8, x_chunk);
+
+            float32x4_t w_row_9 = vld1q_f32(&w[((j+9)*n)+i]);
+            sum_w_x_9 = sum_w_x_9 + vmulq_f32(w_row_9, x_chunk);
+
+            float32x4_t w_row_10 = vld1q_f32(&w[((j+10)*n)+i]);
+            sum_w_x_10 = sum_w_x_10 + vmulq_f32(w_row_10, x_chunk);
+
+            float32x4_t w_row_11 = vld1q_f32(&w[((j+11)*n)+i]);
+            sum_w_x_11 = sum_w_x_11 + vmulq_f32(w_row_11, x_chunk);
+
+            float32x4_t w_row_12 = vld1q_f32(&w[((j+12)*n)+i]);
+            sum_w_x_12 = sum_w_x_12 + vmulq_f32(w_row_12, x_chunk);
+
+            float32x4_t w_row_13 = vld1q_f32(&w[((j+13)*n)+i]);
+            sum_w_x_13 = sum_w_x_13 + vmulq_f32(w_row_13, x_chunk);
+
+            float32x4_t w_row_14 = vld1q_f32(&w[((j+14)*n)+i]);
+            sum_w_x_14 = sum_w_x_14 + vmulq_f32(w_row_14, x_chunk);
+
+            float32x4_t w_row_15 = vld1q_f32(&w[((j+15)*n)+i]);
+            sum_w_x_15 = sum_w_x_15 + vmulq_f32(w_row_15, x_chunk);
+        }
+
+        float sum_0 = vaddvq_f32(sum_w_x_0);
+        float sum_1 = vaddvq_f32(sum_w_x_0);
+        float sum_2 = vaddvq_f32(sum_w_x_0);
+        float sum_3 = vaddvq_f32(sum_w_x_0);
+
+        float sum_4 = vaddvq_f32(sum_w_x_0);
+        float sum_5 = vaddvq_f32(sum_w_x_0);
+        float sum_6 = vaddvq_f32(sum_w_x_0);
+        float sum_7 = vaddvq_f32(sum_w_x_0);
+ 
+        float sum_8 = vaddvq_f32(sum_w_x_0);
+        float sum_9 = vaddvq_f32(sum_w_x_0);
+        float sum_10 = vaddvq_f32(sum_w_x_0);
+        float sum_11 = vaddvq_f32(sum_w_x_0);
+
+        float sum_12 = vaddvq_f32(sum_w_x_0);
+        float sum_13 = vaddvq_f32(sum_w_x_0);
+        float sum_14 = vaddvq_f32(sum_w_x_0);
+        float sum_15 = vaddvq_f32(sum_w_x_0);
+
+        uint32_t remainder = n % 4;
+
+        // TODO: This definitely can be improved
+        // We can eliminate the branch and use masked registers instead
+        // or on ARM devices, use ARM SVE (Scalable vectors)
+        if (remainder > 0)  {
+            // TODO: Confirm the offset is correct
+            for (int i = n - remainder; i < n; ++i) {
+                sum_0 += w[(j+0) * n + i] * x[i];
+                sum_1 += w[(j+1) * n + i] * x[i];
+                sum_2 += w[(j+2) * n + i] * x[i];
+                sum_3 += w[(j+3) * n + i] * x[i];
+
+                sum_4 += w[(j+4) * n + i] * x[i];
+                sum_5 += w[(j+5) * n + i] * x[i];
+                sum_6 += w[(j+6) * n + i] * x[i];
+                sum_7 += w[(j+7) * n + i] * x[i];
+
+                sum_8 += w[(j+8) * n + i] * x[i];
+                sum_9 += w[(j+9) * n + i] * x[i];
+                sum_10 += w[(j+10) * n + i] * x[i];
+                sum_11 += w[(j+11) * n + i] * x[i];
+
+                sum_12 += w[(j+12) * n + i] * x[i];
+                sum_13 += w[(j+13) * n + i] * x[i];
+                sum_14 += w[(j+14) * n + i] * x[i];
+                sum_15 += w[(j+15) * n + i] * x[i];
+            }
+        }
+
+        xout[j+0] = sum_0;
+        xout[j+1] = sum_1;
+        xout[j+2] = sum_2;
+        xout[j+3] = sum_3;
+
+        xout[j+4] = sum_4;
+        xout[j+5] = sum_5;
+        xout[j+6] = sum_6;
+        xout[j+7] = sum_7;
+
+        xout[j+8] = sum_8;
+        xout[j+9] = sum_9;
+        xout[j+10] = sum_10;
+        xout[j+11] = sum_11;
+
+        xout[j+12] = sum_12;
+        xout[j+13] = sum_13;
+        xout[j+14] = sum_14;
+        xout[j+15] = sum_15;
+
+    }
+
+    // TODO: This definitely can be improved
+    // We can eliminate the branch and use masked registers instead
+    // or on ARM devices, use ARM SVE (Scalable vectors)
+    uint32_t remainder = d % 16;
+    if (remainder > 0) {
+        // TODO: Confirm the offset is correct
+        for (int j = d - remainder; j < d; ++j) {
+            float32x4_t sum_w_x_remainder = {0.0f, 0.0f, 0.0f, 0.0f};
+
+            for (int i = 0; i < n; i+4) {
+                float32x4_t x_chunk = vld1q_f32(&x[i]);
+
+                float32x4_t w_row_remainder = vld1q_f32(&w[(j * n) + i]);
+                sum_w_x_remainder += vmulq_f32(w_row_remainder, x_chunk);
+            }
+
+            float sum_remainder = vaddvq_f32(sum_w_x_remainder);
+
+            uint32_t remainder_i = n % 4;
+
+            if (remainder_i > 0) {
+                // TODO: Confirm the offset is correct
+                for (int i = n - remainder_i; i < n; ++i) {
+                    sum_remainder += w[j * n + i] * x[i];
+                }
+            }
+
+            xout[j] = sum_remainder;
+        }
+    }
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -257,7 +518,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+        matmul(s->q, s->xb, w->wq + l*dim*dim,    dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 

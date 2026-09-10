@@ -1,6 +1,6 @@
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
-CC = gcc
+CC = clang
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
@@ -11,8 +11,10 @@ run: run.c
 # useful for a debug build, can then e.g. analyze with valgrind, example:
 # $ valgrind --leak-check=full ./run out/model.bin -n 3
 rundebug: run.c
-	$(CC) -g -o run run.c -lm
-	$(CC) -g -o runq runq.c -lm
+	$(CC) -g -O2 -o run run.c -lm
+	$(CC) -g -O2 -o runq runq.c -lm
+# 	$(CC) -g -O3 -o run run.c -lm
+# 	$(CC) -g -O3 -o runq runq.c -lm
 
 # https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 # https://simonbyrne.github.io/notes/fastmath/
@@ -28,6 +30,11 @@ runfast: run.c
 	$(CC) -Ofast -o run run.c -lm
 	$(CC) -Ofast -o runq runq.c -lm
 
+.PHONY: runfastdebug
+runfastdebug: run.c
+	$(CC) -g -Ofast -o run run.c -lm
+	$(CC) -g -Ofast -o runq runq.c -lm
+
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
 # OMP_NUM_THREADS=4 ./run out/model.bin
@@ -35,6 +42,11 @@ runfast: run.c
 runomp: run.c
 	$(CC) -Ofast -fopenmp -march=native run.c  -lm  -o run
 	$(CC) -Ofast -fopenmp -march=native runq.c  -lm  -o runq
+
+.PHONY: runompdebug
+runompdebug: run.c
+	$(CC) -g -Ofast -fopenmp -march=native run.c  -lm  -o run
+	$(CC) -g -Ofast -fopenmp -march=native runq.c  -lm  -o runq
 
 .PHONY: win64
 win64:
