@@ -22,6 +22,7 @@
 // introduce below, I could change data types some other time
 _Static_assert(sizeof(float) == 4, "Error: float is not 4 bytes on this target!");
 
+char *old_matmul = "";
 
 typedef struct {
     int dim; // transformer dimension
@@ -221,18 +222,31 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
+void matmul_old(float* xout, const float* x, const float* w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
         float val = 0.0f;
-        for (int j = 0; j < n; j++) {
+        for (int j = 0; j < n; j++)
+        {
             val += w[i * n + j] * x[j];
         }
         xout[i] = val;
     }
+}
+
+void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // by far the most amount of time is spent inside this little function
+    // int i;
+    // #pragma omp parallel for private(i)
+    // for (i = 0; i < d; i++) {
+    //     float val = 0.0f;
+    //     for (int j = 0; j < n; j++) {
+    //         val += w[i * n + j] * x[j];
+    //     }
+    //     xout[i] = val;
+    // }
 
     /*
         -- shape of the matmul --
@@ -275,7 +289,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
 
         We have 32 SIMD regiters on the M1 air, lets say we want to use up to 28
             i. Considering load throughput and latency
-            ii. Considering FMA (Fusion Multiply Add/SIMD operations) throughput and latency
+            ii. Considering FMA (Fusion Multiply Add SIMD operations) throughput and latency
 
         -- Load throughput x latency -- 
         For each lane of the sum accumulator, we are generally dependent on the W load
@@ -285,133 +299,123 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         So we can do up to 3 x 4 = 12 loads before stalling 
         (Not sure this statement is correct, need to think more about it)
 
-
-        28 - 7 = 21
-
-        Loads
-        w_loads   =  3 load
-        sum_loads =  3 load
-                    --------
-                     6 loads
-
-
+        TODO: I did a performance modelling / bottleneck analysis in my notes, add here
+        // as a markdown for reference
 
     */
     
-    // 16 chunks
     // we move across the row lockfiles in 1 chunks
-    // I am defining 1 chunk as 4 columns across the row lockstep
-    // since we can only represent 4 floats in a row in one SIMD register
+    // I am defining 1 chunk as 4 columns across the 16 row lockstep of W
+
     // TODO: You can generalise this to be more portable for architectures that can
     // represent more than 4 floats in a SIMD register
 
-    // TODO: Make sure that data adresses are 64 bytes aligned (size of the cache line)
-
-    
-    float32x4_t sum_w_x_0 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_1 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_2 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_3 = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    float32x4_t sum_w_x_4 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_5 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_6 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_7 = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    float32x4_t sum_w_x_8 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_9 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_10 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_11 = {0.0f, 0.0f, 0.0f, 0.0f};
-
-    float32x4_t sum_w_x_12 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_13 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_14 = {0.0f, 0.0f, 0.0f, 0.0f};
-    float32x4_t sum_w_x_15 = {0.0f, 0.0f, 0.0f, 0.0f};
-
+    // TODO: Understand if addresses need to be 64 bytes aligned (size of the cache line)
 
     // j == rows
     // i == columns
-    for (int j = 0; j < d; j+16) {
-        for (int i = 0; i < n; i+4) {
-            // TODO: Think about prefetching
+    for (int j = 0; j < d; j+=16) {
+        float32x4_t sum_w_x_0 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_1 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_2 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_3 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        float32x4_t sum_w_x_4 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_5 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_6 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_7 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        float32x4_t sum_w_x_8 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_9 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_10 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_11 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        float32x4_t sum_w_x_12 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_13 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_14 = {0.0f, 0.0f, 0.0f, 0.0f};
+        float32x4_t sum_w_x_15 = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int i = 0; i < n; i+=4) {
+            // TODO: Think about prefetching W as it doesn't fit into the L1 cache
+            // We could potentially reduce amount of cache misses
+
             float32x4_t x_chunk = vld1q_f32(&x[i]);
             
             float32x4_t w_row_0 = vld1q_f32(&w[((j+0)*n)+i]);
-            sum_w_x_0 = sum_w_x_0 + vmulq_f32(w_row_0, x_chunk);
+            sum_w_x_0 = vmlaq_f32(sum_w_x_0, w_row_0, x_chunk);
 
             float32x4_t w_row_1 = vld1q_f32(&w[((j+1)*n)+i]);
-            sum_w_x_1 = sum_w_x_1 + vmulq_f32(w_row_1, x_chunk);
+            sum_w_x_1 = vmlaq_f32(sum_w_x_1, w_row_1, x_chunk);
 
             float32x4_t w_row_2 = vld1q_f32(&w[((j+2)*n)+i]);
-            sum_w_x_2 = sum_w_x_2 + vmulq_f32(w_row_2, x_chunk);
+            sum_w_x_2 = vmlaq_f32(sum_w_x_2, w_row_2, x_chunk);
 
             float32x4_t w_row_3 = vld1q_f32(&w[((j+3)*n)+i]);
-            sum_w_x_3 = sum_w_x_3 + vmulq_f32(w_row_3, x_chunk);
+            sum_w_x_3 = vmlaq_f32(sum_w_x_3, w_row_3, x_chunk);
 
             float32x4_t w_row_4 = vld1q_f32(&w[((j+4)*n)+i]);
-            sum_w_x_4 = sum_w_x_4 + vmulq_f32(w_row_4, x_chunk);
+            sum_w_x_4 = vmlaq_f32(sum_w_x_4, w_row_4, x_chunk);
 
             float32x4_t w_row_5 = vld1q_f32(&w[((j+5)*n)+i]);
-            sum_w_x_5 = sum_w_x_5 + vmulq_f32(w_row_5, x_chunk);
+            sum_w_x_5 = vmlaq_f32(sum_w_x_5, w_row_5, x_chunk);
 
             float32x4_t w_row_6 = vld1q_f32(&w[((j+6)*n)+i]);
-            sum_w_x_6 = sum_w_x_6 + vmulq_f32(w_row_6, x_chunk);
+            sum_w_x_6 = vmlaq_f32(sum_w_x_6, w_row_6, x_chunk);
 
             float32x4_t w_row_7 = vld1q_f32(&w[((j+7)*n)+i]);
-            sum_w_x_7 = sum_w_x_7 + vmulq_f32(w_row_7, x_chunk);
+            sum_w_x_7 = vmlaq_f32(sum_w_x_7, w_row_7, x_chunk);
 
             float32x4_t w_row_8 = vld1q_f32(&w[((j+8)*n)+i]);
-            sum_w_x_8 = sum_w_x_8 + vmulq_f32(w_row_8, x_chunk);
+            sum_w_x_8 = vmlaq_f32(sum_w_x_8, w_row_8, x_chunk);
 
             float32x4_t w_row_9 = vld1q_f32(&w[((j+9)*n)+i]);
-            sum_w_x_9 = sum_w_x_9 + vmulq_f32(w_row_9, x_chunk);
+            sum_w_x_9 = vmlaq_f32(sum_w_x_9, w_row_9, x_chunk);
 
             float32x4_t w_row_10 = vld1q_f32(&w[((j+10)*n)+i]);
-            sum_w_x_10 = sum_w_x_10 + vmulq_f32(w_row_10, x_chunk);
+            sum_w_x_10 = vmlaq_f32(sum_w_x_10, w_row_10, x_chunk);
 
             float32x4_t w_row_11 = vld1q_f32(&w[((j+11)*n)+i]);
-            sum_w_x_11 = sum_w_x_11 + vmulq_f32(w_row_11, x_chunk);
+            sum_w_x_11 = vmlaq_f32(sum_w_x_11, w_row_11, x_chunk);
 
             float32x4_t w_row_12 = vld1q_f32(&w[((j+12)*n)+i]);
-            sum_w_x_12 = sum_w_x_12 + vmulq_f32(w_row_12, x_chunk);
+            sum_w_x_12 = vmlaq_f32(sum_w_x_12, w_row_12, x_chunk);
 
             float32x4_t w_row_13 = vld1q_f32(&w[((j+13)*n)+i]);
-            sum_w_x_13 = sum_w_x_13 + vmulq_f32(w_row_13, x_chunk);
+            sum_w_x_13 = vmlaq_f32(sum_w_x_13, w_row_13, x_chunk);
 
             float32x4_t w_row_14 = vld1q_f32(&w[((j+14)*n)+i]);
-            sum_w_x_14 = sum_w_x_14 + vmulq_f32(w_row_14, x_chunk);
+            sum_w_x_14 = vmlaq_f32(sum_w_x_14, w_row_14, x_chunk);
 
             float32x4_t w_row_15 = vld1q_f32(&w[((j+15)*n)+i]);
-            sum_w_x_15 = sum_w_x_15 + vmulq_f32(w_row_15, x_chunk);
+            sum_w_x_15 = vmlaq_f32(sum_w_x_15, w_row_15, x_chunk);
         }
 
         float sum_0 = vaddvq_f32(sum_w_x_0);
-        float sum_1 = vaddvq_f32(sum_w_x_0);
-        float sum_2 = vaddvq_f32(sum_w_x_0);
-        float sum_3 = vaddvq_f32(sum_w_x_0);
+        float sum_1 = vaddvq_f32(sum_w_x_1);
+        float sum_2 = vaddvq_f32(sum_w_x_2);
+        float sum_3 = vaddvq_f32(sum_w_x_3);
 
-        float sum_4 = vaddvq_f32(sum_w_x_0);
-        float sum_5 = vaddvq_f32(sum_w_x_0);
-        float sum_6 = vaddvq_f32(sum_w_x_0);
-        float sum_7 = vaddvq_f32(sum_w_x_0);
+        float sum_4 = vaddvq_f32(sum_w_x_4);
+        float sum_5 = vaddvq_f32(sum_w_x_5);
+        float sum_6 = vaddvq_f32(sum_w_x_6);
+        float sum_7 = vaddvq_f32(sum_w_x_7);
  
-        float sum_8 = vaddvq_f32(sum_w_x_0);
-        float sum_9 = vaddvq_f32(sum_w_x_0);
-        float sum_10 = vaddvq_f32(sum_w_x_0);
-        float sum_11 = vaddvq_f32(sum_w_x_0);
+        float sum_8 = vaddvq_f32(sum_w_x_8);
+        float sum_9 = vaddvq_f32(sum_w_x_9);
+        float sum_10 = vaddvq_f32(sum_w_x_10);
+        float sum_11 = vaddvq_f32(sum_w_x_11);
 
-        float sum_12 = vaddvq_f32(sum_w_x_0);
-        float sum_13 = vaddvq_f32(sum_w_x_0);
-        float sum_14 = vaddvq_f32(sum_w_x_0);
-        float sum_15 = vaddvq_f32(sum_w_x_0);
+        float sum_12 = vaddvq_f32(sum_w_x_12);
+        float sum_13 = vaddvq_f32(sum_w_x_13);
+        float sum_14 = vaddvq_f32(sum_w_x_14);
+        float sum_15 = vaddvq_f32(sum_w_x_15);
 
-        uint32_t remainder = n % 4;
+        int remainder = n % 4;
 
         // TODO: This definitely can be improved
         // We can eliminate the branch and use masked registers instead
         // or on ARM devices, use ARM SVE (Scalable vectors)
         if (remainder > 0)  {
-            // TODO: Confirm the offset is correct
             for (int i = n - remainder; i < n; ++i) {
                 sum_0 += w[(j+0) * n + i] * x[i];
                 sum_1 += w[(j+1) * n + i] * x[i];
@@ -454,31 +458,28 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         xout[j+13] = sum_13;
         xout[j+14] = sum_14;
         xout[j+15] = sum_15;
-
     }
 
     // TODO: This definitely can be improved
     // We can eliminate the branch and use masked registers instead
     // or on ARM devices, use ARM SVE (Scalable vectors)
-    uint32_t remainder = d % 16;
+    int remainder = d % 16;
     if (remainder > 0) {
-        // TODO: Confirm the offset is correct
         for (int j = d - remainder; j < d; ++j) {
             float32x4_t sum_w_x_remainder = {0.0f, 0.0f, 0.0f, 0.0f};
 
-            for (int i = 0; i < n; i+4) {
+            for (int i = 0; i < n; i+=4) {
                 float32x4_t x_chunk = vld1q_f32(&x[i]);
 
                 float32x4_t w_row_remainder = vld1q_f32(&w[(j * n) + i]);
-                sum_w_x_remainder += vmulq_f32(w_row_remainder, x_chunk);
+                sum_w_x_remainder = vmlaq_f32(sum_w_x_remainder, w_row_remainder, x_chunk);
             }
 
             float sum_remainder = vaddvq_f32(sum_w_x_remainder);
 
-            uint32_t remainder_i = n % 4;
+            int remainder_i = n % 4;
 
             if (remainder_i > 0) {
-                // TODO: Confirm the offset is correct
                 for (int i = n - remainder_i; i < n; ++i) {
                     sum_remainder += w[j * n + i] * x[i];
                 }
@@ -487,6 +488,69 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
             xout[j] = sum_remainder;
         }
     }
+}
+
+void matmul(float* xout, const float* x, const float* w, int n, int d) {
+    if (strcmp(old_matmul, "y") == 0) {
+        matmul_old(xout, x, w, n, d);
+    } else {
+        matmul_new(xout, x, w, n, d);
+    }
+}
+
+void matmul_test_harness() {
+    const size_t test_array_size_row = 32;
+    const size_t test_array_size_col = 8;
+
+    float x[test_array_size_col];
+    float w[test_array_size_row * test_array_size_col];
+
+    srand(49);
+
+    for (int i = 0; i < test_array_size_col; i++) {
+        x[i] = ((float) rand() / (float) RAND_MAX) * 5.0f;
+    }
+
+    for (int j = 0; j < test_array_size_row; j++) {
+        for (int i = 0; i < test_array_size_col; i++) {
+            w[(j*test_array_size_col) + i] = ((float) rand() / (float) RAND_MAX) * 5.0f;
+        }
+    }
+
+    printf("== x ==\n");
+    for (int i = 0; i < test_array_size_col; i++) {
+        printf("%f ", x[i]);
+    }
+    printf("\n\n");
+
+    printf("== w ==\n");
+    for (int j = 0; j < test_array_size_row * test_array_size_col; j++) {
+        printf("%f ", w[j]);
+        printf((j+1) % test_array_size_col == 0 ? "\n" : "");
+    }
+    printf("\n\n");
+
+    float x_matmul_old[test_array_size_row];
+    memset(x_matmul_old, 0, test_array_size_row * sizeof(float));
+    matmul_old(x_matmul_old, x, w, test_array_size_col, test_array_size_row);
+
+    float x_matmul[test_array_size_row];
+    memset(x_matmul, 0, test_array_size_row * sizeof(float));
+    matmul_new(x_matmul, x, w, test_array_size_col, test_array_size_row);
+    
+    printf("== result of old matmul ==\n");
+    for (int i = 0; i < test_array_size_row; i++) {
+        printf("%f ", x_matmul_old[i]);
+        printf((i+1) % test_array_size_col == 0 ? "\n" : "");
+    }
+    printf("\n\n");
+
+    printf("== result of new matmul ==\n");
+    for (int i = 0; i < test_array_size_row; i++) {
+        printf("%f ", x_matmul[i]);
+        printf((i+1) % test_array_size_col == 0 ? "\n" : "");
+    }
+    printf("\n\n");
 }
 
 float* forward(Transformer* transformer, int token, int pos) {
@@ -1177,6 +1241,8 @@ int main(int argc, char *argv[]) {
     char *mode = "generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
+    char *harness = "n";
+
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
@@ -1193,7 +1259,14 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
+        else if (argv[i][1] == 'h') { harness = argv[i + 1]; }
+        else if (argv[i][1] == 'u') { old_matmul = argv[i + 1]; }
         else { error_usage(); }
+    }
+
+    if (strcmp(harness, "y") == 0) {
+        matmul_test_harness();
+        return 0;
     }
 
     // parameter validation/overrides
