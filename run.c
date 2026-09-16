@@ -163,7 +163,9 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+
+    ssize_t padded_size = (*file_size + 15) & ~15;
+    *data = mmap(NULL, padded_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
@@ -312,9 +314,20 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
 
     // TODO: Understand if addresses need to be 64 bytes aligned (size of the cache line)
 
+
+    float32x4_t lane_index = {0, 1, 2, 3};
+    float32x4_t zero_v = vdupq_n_f32(0.0f);
+
+    float32x4_t remainder_v;
+    float32x4_t mask;
+
+    float32x4_t x_chunk;
+
     // j == rows
     // i == columns
-    for (int j = 0; j < d; j+=16) {
+    int j = 0;
+    for (; j < d; j+=16) {
+
         float32x4_t sum_w_x_0 = {0.0f, 0.0f, 0.0f, 0.0f};
         float32x4_t sum_w_x_1 = {0.0f, 0.0f, 0.0f, 0.0f};
         float32x4_t sum_w_x_2 = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -335,157 +348,223 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
         float32x4_t sum_w_x_14 = {0.0f, 0.0f, 0.0f, 0.0f};
         float32x4_t sum_w_x_15 = {0.0f, 0.0f, 0.0f, 0.0f};
 
-        for (int i = 0; i < n; i+=4) {
+        
+        float32x4_t w_row_0;
+        float32x4_t w_row_1;
+        float32x4_t w_row_2;
+        float32x4_t w_row_3;
+
+        float32x4_t w_row_4;
+        float32x4_t w_row_5;
+        float32x4_t w_row_6;
+        float32x4_t w_row_7;
+
+        float32x4_t w_row_8;
+        float32x4_t w_row_9;
+        float32x4_t w_row_10;
+        float32x4_t w_row_11;
+
+        float32x4_t w_row_12;
+        float32x4_t w_row_13;
+        float32x4_t w_row_14;
+        float32x4_t w_row_15;
+
+        int i = 0;
+        for (; i < n; i+=4) {
             // TODO: Think about prefetching W as it doesn't fit into the L1 cache
             // We could potentially reduce amount of cache misses
 
-            float32x4_t x_chunk = vld1q_f32(&x[i]);
+            x_chunk = vld1q_f32(&x[i]);
             
-            float32x4_t w_row_0 = vld1q_f32(&w[((j+0)*n)+i]);
+            w_row_0 = vld1q_f32(&w[((j+0)*n)+i]);
             sum_w_x_0 = vmlaq_f32(sum_w_x_0, w_row_0, x_chunk);
 
-            float32x4_t w_row_1 = vld1q_f32(&w[((j+1)*n)+i]);
+            w_row_1 = vld1q_f32(&w[((j+1)*n)+i]);
             sum_w_x_1 = vmlaq_f32(sum_w_x_1, w_row_1, x_chunk);
 
-            float32x4_t w_row_2 = vld1q_f32(&w[((j+2)*n)+i]);
+            w_row_2 = vld1q_f32(&w[((j+2)*n)+i]);
             sum_w_x_2 = vmlaq_f32(sum_w_x_2, w_row_2, x_chunk);
 
-            float32x4_t w_row_3 = vld1q_f32(&w[((j+3)*n)+i]);
+            w_row_3 = vld1q_f32(&w[((j+3)*n)+i]);
             sum_w_x_3 = vmlaq_f32(sum_w_x_3, w_row_3, x_chunk);
 
-            float32x4_t w_row_4 = vld1q_f32(&w[((j+4)*n)+i]);
+            w_row_4 = vld1q_f32(&w[((j+4)*n)+i]);
             sum_w_x_4 = vmlaq_f32(sum_w_x_4, w_row_4, x_chunk);
 
-            float32x4_t w_row_5 = vld1q_f32(&w[((j+5)*n)+i]);
+            w_row_5 = vld1q_f32(&w[((j+5)*n)+i]);
             sum_w_x_5 = vmlaq_f32(sum_w_x_5, w_row_5, x_chunk);
 
-            float32x4_t w_row_6 = vld1q_f32(&w[((j+6)*n)+i]);
+            w_row_6 = vld1q_f32(&w[((j+6)*n)+i]);
             sum_w_x_6 = vmlaq_f32(sum_w_x_6, w_row_6, x_chunk);
 
-            float32x4_t w_row_7 = vld1q_f32(&w[((j+7)*n)+i]);
+            w_row_7 = vld1q_f32(&w[((j+7)*n)+i]);
             sum_w_x_7 = vmlaq_f32(sum_w_x_7, w_row_7, x_chunk);
 
-            float32x4_t w_row_8 = vld1q_f32(&w[((j+8)*n)+i]);
+            w_row_8 = vld1q_f32(&w[((j+8)*n)+i]);
             sum_w_x_8 = vmlaq_f32(sum_w_x_8, w_row_8, x_chunk);
 
-            float32x4_t w_row_9 = vld1q_f32(&w[((j+9)*n)+i]);
+            w_row_9 = vld1q_f32(&w[((j+9)*n)+i]);
             sum_w_x_9 = vmlaq_f32(sum_w_x_9, w_row_9, x_chunk);
 
-            float32x4_t w_row_10 = vld1q_f32(&w[((j+10)*n)+i]);
+            w_row_10 = vld1q_f32(&w[((j+10)*n)+i]);
             sum_w_x_10 = vmlaq_f32(sum_w_x_10, w_row_10, x_chunk);
 
-            float32x4_t w_row_11 = vld1q_f32(&w[((j+11)*n)+i]);
+            w_row_11 = vld1q_f32(&w[((j+11)*n)+i]);
             sum_w_x_11 = vmlaq_f32(sum_w_x_11, w_row_11, x_chunk);
 
-            float32x4_t w_row_12 = vld1q_f32(&w[((j+12)*n)+i]);
+            w_row_12 = vld1q_f32(&w[((j+12)*n)+i]);
             sum_w_x_12 = vmlaq_f32(sum_w_x_12, w_row_12, x_chunk);
 
-            float32x4_t w_row_13 = vld1q_f32(&w[((j+13)*n)+i]);
+            w_row_13 = vld1q_f32(&w[((j+13)*n)+i]);
             sum_w_x_13 = vmlaq_f32(sum_w_x_13, w_row_13, x_chunk);
 
-            float32x4_t w_row_14 = vld1q_f32(&w[((j+14)*n)+i]);
+            w_row_14 = vld1q_f32(&w[((j+14)*n)+i]);
             sum_w_x_14 = vmlaq_f32(sum_w_x_14, w_row_14, x_chunk);
 
-            float32x4_t w_row_15 = vld1q_f32(&w[((j+15)*n)+i]);
+            w_row_15 = vld1q_f32(&w[((j+15)*n)+i]);
             sum_w_x_15 = vmlaq_f32(sum_w_x_15, w_row_15, x_chunk);
         }
 
-        float sum_0 = vaddvq_f32(sum_w_x_0);
-        float sum_1 = vaddvq_f32(sum_w_x_1);
-        float sum_2 = vaddvq_f32(sum_w_x_2);
-        float sum_3 = vaddvq_f32(sum_w_x_3);
-
-        float sum_4 = vaddvq_f32(sum_w_x_4);
-        float sum_5 = vaddvq_f32(sum_w_x_5);
-        float sum_6 = vaddvq_f32(sum_w_x_6);
-        float sum_7 = vaddvq_f32(sum_w_x_7);
- 
-        float sum_8 = vaddvq_f32(sum_w_x_8);
-        float sum_9 = vaddvq_f32(sum_w_x_9);
-        float sum_10 = vaddvq_f32(sum_w_x_10);
-        float sum_11 = vaddvq_f32(sum_w_x_11);
-
-        float sum_12 = vaddvq_f32(sum_w_x_12);
-        float sum_13 = vaddvq_f32(sum_w_x_13);
-        float sum_14 = vaddvq_f32(sum_w_x_14);
-        float sum_15 = vaddvq_f32(sum_w_x_15);
-
-        int remainder = n % 4;
+        // 0, 1, 2, 3   4, 5, 6, 7   8, 9
+        // 3
+        i += 1;
+        int remainder = n - i;
 
         // TODO: This definitely can be improved
         // We can eliminate the branch and use masked registers instead
         // or on ARM devices, use ARM SVE (Scalable vectors)
-        if (remainder > 0)  {
-            for (int i = n - remainder; i < n; ++i) {
-                sum_0 += w[(j+0) * n + i] * x[i];
-                sum_1 += w[(j+1) * n + i] * x[i];
-                sum_2 += w[(j+2) * n + i] * x[i];
-                sum_3 += w[(j+3) * n + i] * x[i];
 
-                sum_4 += w[(j+4) * n + i] * x[i];
-                sum_5 += w[(j+5) * n + i] * x[i];
-                sum_6 += w[(j+6) * n + i] * x[i];
-                sum_7 += w[(j+7) * n + i] * x[i];
+        // TODO: I wonder if we eliminate the branch it will be more performant
+        if (remainder > 0) {
+            remainder_v = vdupq_n_f32((float) remainder);
+            
+            mask = vcltq_f32(lane_index, remainder_v);
+            
+            x_chunk = vld1q_f32(&x[i]);
+            x_chunk = vbslq_f32(mask, x_chunk, zero_v);
+            
+            w_row_0 = vld1q_f32(&w[((j+0)*n)+i]);
+            w_row_0 = vbslq_f32(mask, w_row_0, zero_v);
 
-                sum_8 += w[(j+8) * n + i] * x[i];
-                sum_9 += w[(j+9) * n + i] * x[i];
-                sum_10 += w[(j+10) * n + i] * x[i];
-                sum_11 += w[(j+11) * n + i] * x[i];
+            w_row_1 = vld1q_f32(&w[((j+1)*n)+i]);
+            w_row_1 = vbslq_f32(mask, w_row_1, zero_v);
 
-                sum_12 += w[(j+12) * n + i] * x[i];
-                sum_13 += w[(j+13) * n + i] * x[i];
-                sum_14 += w[(j+14) * n + i] * x[i];
-                sum_15 += w[(j+15) * n + i] * x[i];
-            }
+            w_row_2 = vld1q_f32(&w[((j+2)*n)+i]);
+            w_row_2 = vbslq_f32(mask, w_row_2, zero_v);
+
+            w_row_3 = vld1q_f32(&w[((j+3)*n)+i]);
+            w_row_3 = vbslq_f32(mask, w_row_3, zero_v);
+
+            w_row_4 = vld1q_f32(&w[((j+4)*n)+i]);
+            w_row_4 = vbslq_f32(mask, w_row_4, zero_v);
+
+            w_row_5 = vld1q_f32(&w[((j+5)*n)+i]);
+            w_row_5 = vbslq_f32(mask, w_row_5, zero_v);
+
+            w_row_6 = vld1q_f32(&w[((j+6)*n)+i]);
+            w_row_6 = vbslq_f32(mask, w_row_6, zero_v);
+
+            w_row_7 = vld1q_f32(&w[((j+7)*n)+i]);
+            w_row_7 = vbslq_f32(mask, w_row_7, zero_v);
+
+            w_row_8 = vld1q_f32(&w[((j+8)*n)+i]);
+            w_row_8 = vbslq_f32(mask, w_row_8, zero_v);
+
+            w_row_9 = vld1q_f32(&w[((j+9)*n)+i]);
+            w_row_9 = vbslq_f32(mask, w_row_9, zero_v);
+
+            w_row_10 = vld1q_f32(&w[((j+10)*n)+i]);
+            w_row_10 = vbslq_f32(mask, w_row_10, zero_v);
+
+            w_row_11 = vld1q_f32(&w[((j+11)*n)+i]);
+            w_row_11 = vbslq_f32(mask, w_row_11, zero_v);
+
+            w_row_12 = vld1q_f32(&w[((j+12)*n)+i]);
+            w_row_12 = vbslq_f32(mask, w_row_12, zero_v);
+
+            w_row_13 = vld1q_f32(&w[((j+13)*n)+i]);
+            w_row_13 = vbslq_f32(mask, w_row_13, zero_v);
+
+            w_row_14 = vld1q_f32(&w[((j+14)*n)+i]);
+            w_row_14 = vbslq_f32(mask, w_row_14, zero_v);
+
+            w_row_15 = vld1q_f32(&w[((j+15)*n)+i]);
+            w_row_15 = vbslq_f32(mask, w_row_15, zero_v);
+
+
+            sum_w_x_1 = vmlaq_f32(sum_w_x_1, w_row_1, x_chunk);
+            sum_w_x_2 = vmlaq_f32(sum_w_x_2, w_row_2, x_chunk);
+            sum_w_x_3 = vmlaq_f32(sum_w_x_3, w_row_3, x_chunk);
+            sum_w_x_4 = vmlaq_f32(sum_w_x_4, w_row_4, x_chunk);
+            sum_w_x_5 = vmlaq_f32(sum_w_x_5, w_row_5, x_chunk);
+            sum_w_x_6 = vmlaq_f32(sum_w_x_6, w_row_6, x_chunk);
+            sum_w_x_7 = vmlaq_f32(sum_w_x_7, w_row_7, x_chunk);
+            sum_w_x_8 = vmlaq_f32(sum_w_x_8, w_row_8, x_chunk);
+            sum_w_x_9 = vmlaq_f32(sum_w_x_9, w_row_9, x_chunk);
+            sum_w_x_10 = vmlaq_f32(sum_w_x_10, w_row_10, x_chunk);
+            sum_w_x_11 = vmlaq_f32(sum_w_x_11, w_row_11, x_chunk);
+            sum_w_x_12 = vmlaq_f32(sum_w_x_12, w_row_12, x_chunk);
+            sum_w_x_13 = vmlaq_f32(sum_w_x_13, w_row_13, x_chunk);
+            sum_w_x_14 = vmlaq_f32(sum_w_x_14, w_row_14, x_chunk);
+            sum_w_x_15 = vmlaq_f32(sum_w_x_15, w_row_15, x_chunk);
         }
+    
+        xout[j+0] = vaddvq_f32(sum_w_x_0);
+        xout[j+1] = vaddvq_f32(sum_w_x_1);
+        xout[j+2] = vaddvq_f32(sum_w_x_2);
+        xout[j+3] = vaddvq_f32(sum_w_x_3);
 
-        xout[j+0] = sum_0;
-        xout[j+1] = sum_1;
-        xout[j+2] = sum_2;
-        xout[j+3] = sum_3;
+        xout[j+4] = vaddvq_f32(sum_w_x_4);
+        xout[j+5] = vaddvq_f32(sum_w_x_5);
+        xout[j+6] = vaddvq_f32(sum_w_x_6);
+        xout[j+7] = vaddvq_f32(sum_w_x_7);
+ 
+        xout[j+8] = vaddvq_f32(sum_w_x_8);
+        xout[j+9] = vaddvq_f32(sum_w_x_9);
+        xout[j+10] = vaddvq_f32(sum_w_x_10);
+        xout[j+11] = vaddvq_f32(sum_w_x_11);
 
-        xout[j+4] = sum_4;
-        xout[j+5] = sum_5;
-        xout[j+6] = sum_6;
-        xout[j+7] = sum_7;
-
-        xout[j+8] = sum_8;
-        xout[j+9] = sum_9;
-        xout[j+10] = sum_10;
-        xout[j+11] = sum_11;
-
-        xout[j+12] = sum_12;
-        xout[j+13] = sum_13;
-        xout[j+14] = sum_14;
-        xout[j+15] = sum_15;
+        xout[j+12] = vaddvq_f32(sum_w_x_12);
+        xout[j+13] = vaddvq_f32(sum_w_x_13);
+        xout[j+14] = vaddvq_f32(sum_w_x_14);
+        xout[j+15] = vaddvq_f32(sum_w_x_15);
     }
 
     // TODO: This definitely can be improved
     // We can eliminate the branch and use masked registers instead
     // or on ARM devices, use ARM SVE (Scalable vectors)
-    int remainder = d % 16;
+    j += 1;
+    int remainder = d - j;
     if (remainder > 0) {
-        for (int j = d - remainder; j < d; ++j) {
+        for (; j < d; ++j) {
             float32x4_t sum_w_x_remainder = {0.0f, 0.0f, 0.0f, 0.0f};
+            
+            float32x4_t w_row_remainder;
+            int i = 0;
+            for (; i < n; i+=4) {
+                x_chunk = vld1q_f32(&x[i]);
 
-            for (int i = 0; i < n; i+=4) {
-                float32x4_t x_chunk = vld1q_f32(&x[i]);
-
-                float32x4_t w_row_remainder = vld1q_f32(&w[(j * n) + i]);
+                w_row_remainder = vld1q_f32(&w[(j*n) + i]);
                 sum_w_x_remainder = vmlaq_f32(sum_w_x_remainder, w_row_remainder, x_chunk);
             }
 
-            float sum_remainder = vaddvq_f32(sum_w_x_remainder);
 
-            int remainder_i = n % 4;
-
+            i += 1;
+            int remainder_i = n - i;
             if (remainder_i > 0) {
-                for (int i = n - remainder_i; i < n; ++i) {
-                    sum_remainder += w[j * n + i] * x[i];
-                }
+                remainder_v = vdupq_n_f32((float) remainder_i);
+
+                mask = vcltq_f32(lane_index, remainder_v);
+
+                x_chunk = vld1q_f32(&x[i]);
+                x_chunk = vbslq_f32(mask, x_chunk, zero_v);
+
+                w_row_remainder = vld1q_f32(&w[(j*n) + i]);
+                sum_w_x_remainder = vmlaq_f32(sum_w_x_remainder, w_row_remainder, x_chunk);
+
             }
 
-            xout[j] = sum_remainder;
+            xout[j] = vaddvq_f32(sum_w_x_remainder);
         }
     }
 }
