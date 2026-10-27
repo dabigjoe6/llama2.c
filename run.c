@@ -411,6 +411,10 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
 
     float32x4_t x_chunk;
 
+    // Masks built once. Only x gets masked: 0 * w = 0
+    uint32x4_t full_mask = vdupq_n_u32(0xFFFFFFFF);
+    uint32x4_t tail_mask = vcltq_f32(lane_index, vdupq_n_f32((float)(n % 4)));
+
     // j == rows
     // i == columns
     int j = 0;
@@ -460,77 +464,57 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
         int i = 0;
         for (; i < n; i+=4) {
 
-            // we've passed the boundary of n, we need a mask
-            int remainder = (n - i >= 4) ? 4 : n - i;
-
-            remainder_v = vdupq_n_f32((float) remainder);
-            mask = vcltq_f32(lane_index, remainder_v);
-
+            // full passes keep every lane, the last partial pass keeps only the lanes inside the row
+            uint32x4_t x_mask = (n - i >= 4) ? full_mask : tail_mask;
             x_chunk = vld1q_f32(&x[i]);
-            x_chunk = vbslq_f32(mask, x_chunk, zero_v);
+            x_chunk = vbslq_f32(x_mask, x_chunk, zero_v);
             
             w_row_0 = vld1q_f32(&w[((j+0)*n)+i]);
-            w_row_0 = vbslq_f32(mask, w_row_0, zero_v);
             sum_w_x_0 = vmlaq_f32(sum_w_x_0, w_row_0, x_chunk);
 
             w_row_1 = vld1q_f32(&w[((j+1)*n)+i]);
-            w_row_1 = vbslq_f32(mask, w_row_1, zero_v);
             sum_w_x_1 = vmlaq_f32(sum_w_x_1, w_row_1, x_chunk);
 
             w_row_2 = vld1q_f32(&w[((j+2)*n)+i]);
-            w_row_2 = vbslq_f32(mask, w_row_2, zero_v);
             sum_w_x_2 = vmlaq_f32(sum_w_x_2, w_row_2, x_chunk);
 
             w_row_3 = vld1q_f32(&w[((j+3)*n)+i]);
-            w_row_3 = vbslq_f32(mask, w_row_3, zero_v);
             sum_w_x_3 = vmlaq_f32(sum_w_x_3, w_row_3, x_chunk);
 
             w_row_4 = vld1q_f32(&w[((j+4)*n)+i]);
-            w_row_4 = vbslq_f32(mask, w_row_4, zero_v);
             sum_w_x_4 = vmlaq_f32(sum_w_x_4, w_row_4, x_chunk);
 
             w_row_5 = vld1q_f32(&w[((j+5)*n)+i]);
-            w_row_5 = vbslq_f32(mask, w_row_5, zero_v);
             sum_w_x_5 = vmlaq_f32(sum_w_x_5, w_row_5, x_chunk);
 
             w_row_6 = vld1q_f32(&w[((j+6)*n)+i]);
-            w_row_6 = vbslq_f32(mask, w_row_6, zero_v);
             sum_w_x_6 = vmlaq_f32(sum_w_x_6, w_row_6, x_chunk);
 
             w_row_7 = vld1q_f32(&w[((j+7)*n)+i]);
-            w_row_7 = vbslq_f32(mask, w_row_7, zero_v);
             sum_w_x_7 = vmlaq_f32(sum_w_x_7, w_row_7, x_chunk);
 
             w_row_8 = vld1q_f32(&w[((j+8)*n)+i]);
-            w_row_8 = vbslq_f32(mask, w_row_8, zero_v);
             sum_w_x_8 = vmlaq_f32(sum_w_x_8, w_row_8, x_chunk);
 
             w_row_9 = vld1q_f32(&w[((j+9)*n)+i]);
-            w_row_9 = vbslq_f32(mask, w_row_9, zero_v);
             sum_w_x_9 = vmlaq_f32(sum_w_x_9, w_row_9, x_chunk);
 
             w_row_10 = vld1q_f32(&w[((j+10)*n)+i]);
-            w_row_10 = vbslq_f32(mask, w_row_10, zero_v);
             sum_w_x_10 = vmlaq_f32(sum_w_x_10, w_row_10, x_chunk);
 
             w_row_11 = vld1q_f32(&w[((j+11)*n)+i]);
-            w_row_11 = vbslq_f32(mask, w_row_11, zero_v);
             sum_w_x_11 = vmlaq_f32(sum_w_x_11, w_row_11, x_chunk);
 
             w_row_12 = vld1q_f32(&w[((j+12)*n)+i]);
-            w_row_12 = vbslq_f32(mask, w_row_12, zero_v);
             sum_w_x_12 = vmlaq_f32(sum_w_x_12, w_row_12, x_chunk);
 
             w_row_13 = vld1q_f32(&w[((j+13)*n)+i]);
-            w_row_13 = vbslq_f32(mask, w_row_13, zero_v);
             sum_w_x_13 = vmlaq_f32(sum_w_x_13, w_row_13, x_chunk);
 
             w_row_14 = vld1q_f32(&w[((j+14)*n)+i]);
-            w_row_14 = vbslq_f32(mask, w_row_14, zero_v);
             sum_w_x_14 = vmlaq_f32(sum_w_x_14, w_row_14, x_chunk);
 
             w_row_15 = vld1q_f32(&w[((j+15)*n)+i]);
-            w_row_15 = vbslq_f32(mask, w_row_15, zero_v);
             sum_w_x_15 = vmlaq_f32(sum_w_x_15, w_row_15, x_chunk);
         }
     
@@ -594,15 +578,12 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
     }
 }
 
-// Same compute as matmul_new (same 16 rows, same mask), so the ONLY difference is where
+// Same compute as matmul_new (same 16 rows), so the ONLY difference is where
 // the W chunks come from: the packed layout made by pack_matrix. Each pass reads
 // 16 chunks x 4 floats = 256 bytes that sit next to each other in memory.
 // Requires d % 16 == 0 and n % 4 == 0 (pack_weights checks this before packing).
+// No masks: with n % 4 == 0 every pass is a full 4-float chunk.
 void matmul_packed(float* xout, const float* x, const float* wp, int n, int d) {
-    float32x4_t lane_index = {0, 1, 2, 3};
-    float32x4_t zero_v = vdupq_n_f32(0.0f);
-    float32x4_t remainder_v;
-    float32x4_t mask;
     float32x4_t x_chunk;
 
     for (int j = 0; j < d; j += 16) {
@@ -644,63 +625,43 @@ void matmul_packed(float* xout, const float* x, const float* wp, int n, int d) {
         float32x4_t w_row_15;
 
         for (int i = 0; i < n; i += 4) {
-            int remainder = (n - i >= 4) ? 4 : n - i;
-            remainder_v = vdupq_n_f32((float) remainder);
-            mask = vcltq_f32(lane_index, remainder_v);
 
             x_chunk = vld1q_f32(&x[i]);
-            x_chunk = vbslq_f32(mask, x_chunk, zero_v);
 
             // chunk i/4 of rows j..j+15, back to back
             const float* w_chunk = w_block + (size_t)i * 16;
 
             w_row_0 = vld1q_f32(w_chunk + 0);
-            w_row_0 = vbslq_f32(mask, w_row_0, zero_v);
             sum_w_x_0 = vmlaq_f32(sum_w_x_0, w_row_0, x_chunk);
             w_row_1 = vld1q_f32(w_chunk + 4);
-            w_row_1 = vbslq_f32(mask, w_row_1, zero_v);
             sum_w_x_1 = vmlaq_f32(sum_w_x_1, w_row_1, x_chunk);
             w_row_2 = vld1q_f32(w_chunk + 8);
-            w_row_2 = vbslq_f32(mask, w_row_2, zero_v);
             sum_w_x_2 = vmlaq_f32(sum_w_x_2, w_row_2, x_chunk);
             w_row_3 = vld1q_f32(w_chunk + 12);
-            w_row_3 = vbslq_f32(mask, w_row_3, zero_v);
             sum_w_x_3 = vmlaq_f32(sum_w_x_3, w_row_3, x_chunk);
             w_row_4 = vld1q_f32(w_chunk + 16);
-            w_row_4 = vbslq_f32(mask, w_row_4, zero_v);
             sum_w_x_4 = vmlaq_f32(sum_w_x_4, w_row_4, x_chunk);
             w_row_5 = vld1q_f32(w_chunk + 20);
-            w_row_5 = vbslq_f32(mask, w_row_5, zero_v);
             sum_w_x_5 = vmlaq_f32(sum_w_x_5, w_row_5, x_chunk);
             w_row_6 = vld1q_f32(w_chunk + 24);
-            w_row_6 = vbslq_f32(mask, w_row_6, zero_v);
             sum_w_x_6 = vmlaq_f32(sum_w_x_6, w_row_6, x_chunk);
             w_row_7 = vld1q_f32(w_chunk + 28);
-            w_row_7 = vbslq_f32(mask, w_row_7, zero_v);
             sum_w_x_7 = vmlaq_f32(sum_w_x_7, w_row_7, x_chunk);
             w_row_8 = vld1q_f32(w_chunk + 32);
-            w_row_8 = vbslq_f32(mask, w_row_8, zero_v);
             sum_w_x_8 = vmlaq_f32(sum_w_x_8, w_row_8, x_chunk);
             w_row_9 = vld1q_f32(w_chunk + 36);
-            w_row_9 = vbslq_f32(mask, w_row_9, zero_v);
             sum_w_x_9 = vmlaq_f32(sum_w_x_9, w_row_9, x_chunk);
             w_row_10 = vld1q_f32(w_chunk + 40);
-            w_row_10 = vbslq_f32(mask, w_row_10, zero_v);
             sum_w_x_10 = vmlaq_f32(sum_w_x_10, w_row_10, x_chunk);
             w_row_11 = vld1q_f32(w_chunk + 44);
-            w_row_11 = vbslq_f32(mask, w_row_11, zero_v);
             sum_w_x_11 = vmlaq_f32(sum_w_x_11, w_row_11, x_chunk);
             w_row_12 = vld1q_f32(w_chunk + 48);
-            w_row_12 = vbslq_f32(mask, w_row_12, zero_v);
             sum_w_x_12 = vmlaq_f32(sum_w_x_12, w_row_12, x_chunk);
             w_row_13 = vld1q_f32(w_chunk + 52);
-            w_row_13 = vbslq_f32(mask, w_row_13, zero_v);
             sum_w_x_13 = vmlaq_f32(sum_w_x_13, w_row_13, x_chunk);
             w_row_14 = vld1q_f32(w_chunk + 56);
-            w_row_14 = vbslq_f32(mask, w_row_14, zero_v);
             sum_w_x_14 = vmlaq_f32(sum_w_x_14, w_row_14, x_chunk);
             w_row_15 = vld1q_f32(w_chunk + 60);
-            w_row_15 = vbslq_f32(mask, w_row_15, zero_v);
             sum_w_x_15 = vmlaq_f32(sum_w_x_15, w_row_15, x_chunk);
         }
 
