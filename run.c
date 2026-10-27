@@ -8,6 +8,9 @@
 #include <string.h>
 #include <fcntl.h>
 #include <arm_neon.h>
+#ifdef __APPLE__
+    #include <pthread.h>
+#endif
 #if defined _WIN32
     #include "win.h"
 #else
@@ -23,6 +26,7 @@
 _Static_assert(sizeof(float) == 4, "Error: float is not 4 bytes on this target!");
 
 char *old_matmul = "";
+char *packed_matmul = "n";
 
 typedef struct {
     int dim; // transformer dimension
@@ -80,6 +84,9 @@ typedef struct {
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
     ssize_t file_size; // size of the checkpoint file in bytes
+    // packed copies of the matmul weights (see pack_weights)
+    TransformerWeights packed;
+    float* packed_data; // the one buffer behind `packed`, NULL if packing is off
 } Transformer;
 
 void malloc_run_state(RunState* s, Config* p) {
@@ -172,11 +179,92 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
+// ----------------------------------------------------------------------------
+// Weight packing: reorder W once, at load time, so matmul_packed reads one stream.
+//
+//   each box = one 4-float chunk, rN = row N, cN = chunk N
+//
+//   row-major:         [r0c0][r0c1]...[r0c71] [r1c0][r1c1]...[r1c71] ... [r15c0]...
+//                      pass 1 needs r0c0, r1c0 ... r15c0 = 16 places, 1152 bytes apart
+//
+//   packed (per block of 16 rows):
+//                      [r0c0][r1c0]...[r15c0] [r0c1][r1c1]...[r15c1] [r0c2] ...
+//                      └──────── pass 1 ────────┘ └──────── pass 2 ─────────┘
+//
+// With d % 16 == 0 and n % 4 == 0 the packed matrix is the same size as the original,
+// so the per-layer offsets in forward() (l*dim*dim etc.) stay exactly the same.
+#define PACK_ROWS 16
+
+static int can_pack(int n, int d) { return d % PACK_ROWS == 0 && n % 4 == 0; }
+
+// `rows` can span several stacked layers in one call, because every layer's d is a
+// multiple of 16, so no block of 16 rows ever straddles two layers.
+static void pack_matrix(float* dst, const float* src, size_t rows, int n) {
+    size_t nchunks = (size_t)n / 4;
+    for (size_t b = 0; b < rows / PACK_ROWS; b++) {           // each block of 16 rows
+        for (size_t c = 0; c < nchunks; c++) {                // each 4-float chunk
+            for (int r = 0; r < PACK_ROWS; r++) {             // that chunk of all 16 rows
+                const float* s = src + (b * PACK_ROWS + r) * (size_t)n + c * 4;
+                dst[0] = s[0]; dst[1] = s[1]; dst[2] = s[2]; dst[3] = s[3];
+                dst += 4;
+            }
+        }
+    }
+}
+
+// Packs every matmul weight into one 128-byte aligned buffer. Returns 0 if a shape doesn't fit.
+static int pack_weights(Transformer* t) {
+    Config* p = &t->config;
+    TransformerWeights* w = &t->weights;
+    TransformerWeights* pw = &t->packed;
+    size_t L = p->n_layers;
+    int dim = p->dim, hid = p->hidden_dim, vocab = p->vocab_size;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+
+    // every matmul shape (n, d) used in forward() must suit the packed kernel
+    if (!can_pack(dim, dim) || !can_pack(dim, kv_dim) || !can_pack(dim, hid) ||
+        !can_pack(hid, dim) || !can_pack(dim, vocab)) {
+        return 0;
+    }
+
+    size_t sz_q   = L * dim * dim;
+    size_t sz_kv  = L * kv_dim * dim;
+    size_t sz_o   = L * dim * dim;
+    size_t sz_ff  = L * hid * dim;
+    size_t sz_cls = (size_t)vocab * dim;
+    size_t total  = sz_q + 2 * sz_kv + sz_o + 3 * sz_ff + sz_cls;
+
+    // aligned to the 128-byte cache line
+    float* buf = NULL;
+    if (posix_memalign((void**)&buf, 128, total * sizeof(float)) != 0) { return 0; }
+
+    memset(pw, 0, sizeof(*pw));
+    float* ptr = buf;
+    // one call per weight type, covering all layers at once
+    pw->wq   = ptr; pack_matrix(ptr, w->wq,   L * dim,    dim); ptr += sz_q;
+    pw->wk   = ptr; pack_matrix(ptr, w->wk,   L * kv_dim, dim); ptr += sz_kv;
+    pw->wv   = ptr; pack_matrix(ptr, w->wv,   L * kv_dim, dim); ptr += sz_kv;
+    pw->wo   = ptr; pack_matrix(ptr, w->wo,   L * dim,    dim); ptr += sz_o;
+    pw->w1   = ptr; pack_matrix(ptr, w->w1,   L * hid,    dim); ptr += sz_ff;
+    pw->w2   = ptr; pack_matrix(ptr, w->w2,   L * dim,    hid); ptr += sz_ff;   // n = hidden_dim here
+    pw->w3   = ptr; pack_matrix(ptr, w->w3,   L * hid,    dim); ptr += sz_ff;
+    pw->wcls = ptr; pack_matrix(ptr, w->wcls, vocab,      dim); ptr += sz_cls;
+
+    t->packed_data = buf;
+    return 1;
+}
+
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
+    // pack once here, at load time
+    t->packed_data = NULL;
+    if (strcmp(packed_matmul, "y") == 0 && !pack_weights(t)) {
+        fprintf(stderr, "packing skipped: a matmul shape isn't a multiple of 16 rows / 4 columns\n");
+        packed_matmul = "n";
+    }
 }
 
 void free_transformer(Transformer* t) {
@@ -185,6 +273,8 @@ void free_transformer(Transformer* t) {
     if (t->fd != -1) { close(t->fd); }
     // free the RunState buffers
     free_run_state(&t->state);
+    // free the packed weights (free(NULL) does nothing)
+    free(t->packed_data);
 }
 
 // ----------------------------------------------------------------------------
@@ -369,15 +459,12 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
 
         int i = 0;
         for (; i < n; i+=4) {
-            // TODO: Think about prefetching W as it doesn't fit into the L1 cache
-            // We could potentially reduce amount of cache misses
 
             // we've passed the boundary of n, we need a mask
             int remainder = (n - i >= 4) ? 4 : n - i;
 
             remainder_v = vdupq_n_f32((float) remainder);
             mask = vcltq_f32(lane_index, remainder_v);
-
 
             x_chunk = vld1q_f32(&x[i]);
             x_chunk = vbslq_f32(mask, x_chunk, zero_v);
@@ -507,9 +594,140 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
     }
 }
 
+// Same compute as matmul_new (same 16 rows, same mask), so the ONLY difference is where
+// the W chunks come from: the packed layout made by pack_matrix. Each pass reads
+// 16 chunks x 4 floats = 256 bytes that sit next to each other in memory.
+// Requires d % 16 == 0 and n % 4 == 0 (pack_weights checks this before packing).
+void matmul_packed(float* xout, const float* x, const float* wp, int n, int d) {
+    float32x4_t lane_index = {0, 1, 2, 3};
+    float32x4_t zero_v = vdupq_n_f32(0.0f);
+    float32x4_t remainder_v;
+    float32x4_t mask;
+    float32x4_t x_chunk;
+
+    for (int j = 0; j < d; j += 16) {
+        // start of this 16-row block in the packed array (16 rows x n floats)
+        const float* w_block = wp + (size_t)j * n;
+
+        float32x4_t sum_w_x_0 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_1 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_2 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_3 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_4 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_5 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_6 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_7 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_8 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_9 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_10 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_11 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_12 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_13 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_14 = vdupq_n_f32(0.0f);
+        float32x4_t sum_w_x_15 = vdupq_n_f32(0.0f);
+
+        float32x4_t w_row_0;
+        float32x4_t w_row_1;
+        float32x4_t w_row_2;
+        float32x4_t w_row_3;
+        float32x4_t w_row_4;
+        float32x4_t w_row_5;
+        float32x4_t w_row_6;
+        float32x4_t w_row_7;
+        float32x4_t w_row_8;
+        float32x4_t w_row_9;
+        float32x4_t w_row_10;
+        float32x4_t w_row_11;
+        float32x4_t w_row_12;
+        float32x4_t w_row_13;
+        float32x4_t w_row_14;
+        float32x4_t w_row_15;
+
+        for (int i = 0; i < n; i += 4) {
+            int remainder = (n - i >= 4) ? 4 : n - i;
+            remainder_v = vdupq_n_f32((float) remainder);
+            mask = vcltq_f32(lane_index, remainder_v);
+
+            x_chunk = vld1q_f32(&x[i]);
+            x_chunk = vbslq_f32(mask, x_chunk, zero_v);
+
+            // chunk i/4 of rows j..j+15, back to back
+            const float* w_chunk = w_block + (size_t)i * 16;
+
+            w_row_0 = vld1q_f32(w_chunk + 0);
+            w_row_0 = vbslq_f32(mask, w_row_0, zero_v);
+            sum_w_x_0 = vmlaq_f32(sum_w_x_0, w_row_0, x_chunk);
+            w_row_1 = vld1q_f32(w_chunk + 4);
+            w_row_1 = vbslq_f32(mask, w_row_1, zero_v);
+            sum_w_x_1 = vmlaq_f32(sum_w_x_1, w_row_1, x_chunk);
+            w_row_2 = vld1q_f32(w_chunk + 8);
+            w_row_2 = vbslq_f32(mask, w_row_2, zero_v);
+            sum_w_x_2 = vmlaq_f32(sum_w_x_2, w_row_2, x_chunk);
+            w_row_3 = vld1q_f32(w_chunk + 12);
+            w_row_3 = vbslq_f32(mask, w_row_3, zero_v);
+            sum_w_x_3 = vmlaq_f32(sum_w_x_3, w_row_3, x_chunk);
+            w_row_4 = vld1q_f32(w_chunk + 16);
+            w_row_4 = vbslq_f32(mask, w_row_4, zero_v);
+            sum_w_x_4 = vmlaq_f32(sum_w_x_4, w_row_4, x_chunk);
+            w_row_5 = vld1q_f32(w_chunk + 20);
+            w_row_5 = vbslq_f32(mask, w_row_5, zero_v);
+            sum_w_x_5 = vmlaq_f32(sum_w_x_5, w_row_5, x_chunk);
+            w_row_6 = vld1q_f32(w_chunk + 24);
+            w_row_6 = vbslq_f32(mask, w_row_6, zero_v);
+            sum_w_x_6 = vmlaq_f32(sum_w_x_6, w_row_6, x_chunk);
+            w_row_7 = vld1q_f32(w_chunk + 28);
+            w_row_7 = vbslq_f32(mask, w_row_7, zero_v);
+            sum_w_x_7 = vmlaq_f32(sum_w_x_7, w_row_7, x_chunk);
+            w_row_8 = vld1q_f32(w_chunk + 32);
+            w_row_8 = vbslq_f32(mask, w_row_8, zero_v);
+            sum_w_x_8 = vmlaq_f32(sum_w_x_8, w_row_8, x_chunk);
+            w_row_9 = vld1q_f32(w_chunk + 36);
+            w_row_9 = vbslq_f32(mask, w_row_9, zero_v);
+            sum_w_x_9 = vmlaq_f32(sum_w_x_9, w_row_9, x_chunk);
+            w_row_10 = vld1q_f32(w_chunk + 40);
+            w_row_10 = vbslq_f32(mask, w_row_10, zero_v);
+            sum_w_x_10 = vmlaq_f32(sum_w_x_10, w_row_10, x_chunk);
+            w_row_11 = vld1q_f32(w_chunk + 44);
+            w_row_11 = vbslq_f32(mask, w_row_11, zero_v);
+            sum_w_x_11 = vmlaq_f32(sum_w_x_11, w_row_11, x_chunk);
+            w_row_12 = vld1q_f32(w_chunk + 48);
+            w_row_12 = vbslq_f32(mask, w_row_12, zero_v);
+            sum_w_x_12 = vmlaq_f32(sum_w_x_12, w_row_12, x_chunk);
+            w_row_13 = vld1q_f32(w_chunk + 52);
+            w_row_13 = vbslq_f32(mask, w_row_13, zero_v);
+            sum_w_x_13 = vmlaq_f32(sum_w_x_13, w_row_13, x_chunk);
+            w_row_14 = vld1q_f32(w_chunk + 56);
+            w_row_14 = vbslq_f32(mask, w_row_14, zero_v);
+            sum_w_x_14 = vmlaq_f32(sum_w_x_14, w_row_14, x_chunk);
+            w_row_15 = vld1q_f32(w_chunk + 60);
+            w_row_15 = vbslq_f32(mask, w_row_15, zero_v);
+            sum_w_x_15 = vmlaq_f32(sum_w_x_15, w_row_15, x_chunk);
+        }
+
+        xout[j+0] = vaddvq_f32(sum_w_x_0);
+        xout[j+1] = vaddvq_f32(sum_w_x_1);
+        xout[j+2] = vaddvq_f32(sum_w_x_2);
+        xout[j+3] = vaddvq_f32(sum_w_x_3);
+        xout[j+4] = vaddvq_f32(sum_w_x_4);
+        xout[j+5] = vaddvq_f32(sum_w_x_5);
+        xout[j+6] = vaddvq_f32(sum_w_x_6);
+        xout[j+7] = vaddvq_f32(sum_w_x_7);
+        xout[j+8] = vaddvq_f32(sum_w_x_8);
+        xout[j+9] = vaddvq_f32(sum_w_x_9);
+        xout[j+10] = vaddvq_f32(sum_w_x_10);
+        xout[j+11] = vaddvq_f32(sum_w_x_11);
+        xout[j+12] = vaddvq_f32(sum_w_x_12);
+        xout[j+13] = vaddvq_f32(sum_w_x_13);
+        xout[j+14] = vaddvq_f32(sum_w_x_14);
+        xout[j+15] = vaddvq_f32(sum_w_x_15);
+    }
+}
+
 void matmul(float* xout, const float* x, const float* w, int n, int d) {
     if (strcmp(old_matmul, "y") == 0) {
         matmul_old(xout, x, w, n, d);
+    } else if (strcmp(packed_matmul, "y") == 0) {
+        matmul_packed(xout, x, w, n, d);
     } else {
         matmul_new(xout, x, w, n, d);
     }
@@ -521,33 +739,63 @@ static double now_ns(void) {
     return ts.tv_sec * 1e9 + ts.tv_nsec;
 }
 
-static void bench(const char *label,
-                  void (*mm)(float*, const float*, const float*, int, int),
-                  float *xout, const float *x, const float *w, int n, int d, int reps) {
-    mm(xout, x, w, n, d);                              // warm up
-    double t0 = now_ns();
-    for (int r = 0; r < reps; r++) mm(xout, x, w, n, d);
-    double ns  = (now_ns() - t0) / reps;
-    double gbs = (double)n * d * sizeof(float) / ns;   // bytes per ns = GB/s
-    printf("%-4s d=%-6d %10.0f ns/call  %5.1f GB/s  (check %f)\n",
-           label, d, ns, gbs, xout[d / 2]);
+typedef void (*matmul_fn)(float*, const float*, const float*, int, int);
+
+static int cmp_double(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return (x > y) - (x < y);
+}
+
+// Times each kernel `trials` times, interleaved: old, new, packed, old, new, packed, ...
+// so a slow moment (E-core, throttling) hits all three, not just one.
+// Reports the fastest trial (best case the code can do) and the median trial (typical).
+static void bench_all(int n, int d, int reps, int trials) {
+    float *w    = malloc((size_t)n * d * sizeof(float));
+    float *wp   = NULL; // packed matrix
+    float *x    = malloc(n * sizeof(float));
+    float *xout = malloc(d * sizeof(float));
+    float *ref  = malloc(d * sizeof(float));
+    for (size_t i = 0; i < (size_t)n * d; i++) w[i] = (float)rand() / (float)RAND_MAX - 0.5f;
+    for (int i = 0; i < n; i++)                x[i] = (float)rand() / (float)RAND_MAX - 0.5f;
+    if (posix_memalign((void**)&wp, 128, (size_t)n * d * sizeof(float)) != 0) { exit(EXIT_FAILURE); }
+    pack_matrix(wp, w, d, n);
+
+    const char*  labels[3] = {"old", "new", "packed"};
+    matmul_fn    fns[3]    = {matmul_old, matmul_new, matmul_packed};
+    const float* ws[3]     = {w, w, wp};
+    double       times[3][64];
+
+    matmul_old(ref, x, w, n, d);                                 // reference answer
+    for (int k = 0; k < 3; k++) fns[k](xout, x, ws[k], n, d);    // warm up
+
+    for (int t = 0; t < trials; t++) {
+        for (int k = 0; k < 3; k++) {
+            double t0 = now_ns();
+            for (int r = 0; r < reps; r++) fns[k](xout, x, ws[k], n, d);
+            times[k][t] = (now_ns() - t0) / reps;
+        }
+    }
+
+    double bytes = (double)n * d * sizeof(float);
+    for (int k = 0; k < 3; k++) {
+        fns[k](xout, x, ws[k], n, d);
+        float maxdiff = 0.0f;                                    // largest gap from old's answer
+        for (int i = 0; i < d; i++) {
+            float e = fabsf(xout[i] - ref[i]);
+            if (e > maxdiff) maxdiff = e;
+        }
+        qsort(times[k], trials, sizeof(double), cmp_double);
+        double best = times[k][0], med = times[k][trials / 2];
+        printf("%-7s d=%-6d best %9.0f ns (%5.1f GB/s)   median %9.0f ns (%5.1f GB/s)   max diff %.1e\n",
+               labels[k], d, best, bytes / best, med, bytes / med, maxdiff);
+    }
+    printf("\n");
+    free(w); free(wp); free(x); free(xout); free(ref);
 }
 
 void matmul_cache_test(void) {
-    int n = 288;
-    int sizes[] = {288, 32000};
-    int reps[]  = {20000, 200};
-    for (int s = 0; s < 2; s++) {
-        int d = sizes[s];
-        float *w    = malloc((size_t)n * d * sizeof(float));
-        float *x    = malloc(n * sizeof(float));
-        float *xout = malloc(d * sizeof(float));
-        for (size_t i = 0; i < (size_t)n * d; i++) w[i] = (float)rand() / (float)RAND_MAX - 0.5f;
-        for (int i = 0; i < n; i++)                x[i] = (float)rand() / (float)RAND_MAX - 0.5f;
-        bench("old", matmul_old, xout, x, w, n, d, reps[s]);
-        bench("new", matmul_new, xout, x, w, n, d, reps[s]);
-        free(w); free(x); free(xout);
-    }
+    bench_all(288, 288,   5000, 15);   // W = 330 KB, stays in L2
+    bench_all(288, 32000,   50, 15);   // W = 37 MB, streams from DRAM
 }
 
 // Was trying to use a smaller subset to understand why the matmul was previously wrong
@@ -612,6 +860,9 @@ float* forward(Transformer* transformer, int token, int pos) {
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
+    // weights for the matmuls: the packed copies when packing is on, otherwise the originals
+    TransformerWeights* mw = (strcmp(packed_matmul, "y") == 0 && strcmp(old_matmul, "y") != 0)
+                             ? &transformer->packed : w;
     float *x = s->x;
     int dim = p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -635,9 +886,9 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim,    dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->q, s->xb, mw->wq + l*dim*dim,    dim, dim);
+        matmul(s->k, s->xb, mw->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, mw->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
@@ -697,7 +948,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        matmul(s->xb2, s->xb, mw->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
@@ -709,8 +960,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, mw->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, mw->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -723,7 +974,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, mw->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
         for (int i = 0; i < dim; i++) {
@@ -735,7 +986,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, mw->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
 
@@ -1296,6 +1547,11 @@ int main(int argc, char *argv[]) {
 
     char *harness = "n";
 
+#ifdef __APPLE__
+    // ask macOS to schedule us like a foreground app, so we stay on the performance cores
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
     // poor man's C argparse so we can override the defaults above from the command line
     if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
     for (int i = 2; i < argc; i+=2) {
@@ -1314,6 +1570,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'h') { harness = argv[i + 1]; }
         else if (argv[i][1] == 'u') { old_matmul = argv[i + 1]; }
+        else if (argv[i][1] == 'k') { packed_matmul = argv[i + 1]; }
         else { error_usage(); }
     }
 
