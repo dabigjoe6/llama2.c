@@ -412,8 +412,8 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
     float32x4_t x_chunk;
 
     // Masks built once. Only x gets masked: 0 * w = 0
-    uint32x4_t full_mask = vdupq_n_u32(0xFFFFFFFF);
-    uint32x4_t tail_mask = vcltq_f32(lane_index, vdupq_n_f32((float)(n % 4)));
+    uint32x4_t full_mask = vcltq_f32(lane_index, vdupq_n_f32(4.0f));   // all 4 lanes
+    uint32x4_t tail_mask = vcltq_f32(lane_index, vdupq_n_f32((float)(n % 4))); // first n%4 lanes
 
     // j == rows
     // i == columns
