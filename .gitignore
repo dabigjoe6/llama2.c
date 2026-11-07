@@ -1,0 +1,13 @@
+# build outputs
+run
+runq
+*.dSYM/
+
+# profiler traces
+*.trace/
+
+# model weights (download separately, see README)
+stories15M.bin
+
+# editor
+.vscode/

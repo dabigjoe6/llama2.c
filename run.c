@@ -328,6 +328,9 @@ void matmul_old(float* xout, const float* x, const float* w, int n, int d) {
     }
 }
 
+// NOTE: matmul_new and matmul_packed were written to learn how to write fast code
+// (SIMD, register blocking, memory layout), not as production code. They are not
+// written with portability, error handling or best practices in mind.
 void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -392,12 +395,12 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
         So we can do up to 3 x 4 = 12 loads before stalling 
         (Not sure this statement is correct, need to think more about it)
 
-        TODO: I did a performance modelling / bottleneck analysis in my notes, add here
-        // as a markdown for reference
+        The full performance model / bottleneck analysis this design came from
+        is written up in the README.
 
     */
     
-    // we move across the row lockfiles in 1 chunks
+    // we move across the 16-row lockstep 1 chunk at a time
     // I am defining 1 chunk as 4 columns across the 16 row lockstep of W
 
     // TODO: You can generalise this to be more portable for architectures that can
