@@ -180,7 +180,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
 }
 
 // ----------------------------------------------------------------------------
-// Weight packing: reorder W once, at load time, so matmul_packed reads one stream.
+// Weight packing: reorder W once, at load time, so matmul_simd_packed reads one stream.
 //
 //   each box = one 4-float chunk, rN = row N, cN = chunk N
 //
@@ -328,10 +328,10 @@ void matmul_old(float* xout, const float* x, const float* w, int n, int d) {
     }
 }
 
-// NOTE: matmul_new and matmul_packed were written to learn how to write fast code
+// NOTE: matmul_simd and matmul_simd_packed were written to learn how to write performant code
 // (SIMD, register blocking, memory layout), not as production code. They are not
 // written with portability, error handling or best practices in mind.
-void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
+void matmul_simd(float* xout, const float* x, const float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
     // int i;
@@ -581,12 +581,12 @@ void matmul_new(float* xout, const float* x, const float* w, int n, int d) {
     }
 }
 
-// Same compute as matmul_new (same 16 rows), so the ONLY difference is where
+// Same compute as matmul_simd (same 16 rows), so the ONLY difference is where
 // the W chunks come from: the packed layout made by pack_matrix. Each pass reads
 // 16 chunks x 4 floats = 256 bytes that sit next to each other in memory.
 // Requires d % 16 == 0 and n % 4 == 0 (pack_weights checks this before packing).
 // No masks: with n % 4 == 0 every pass is a full 4-float chunk.
-void matmul_packed(float* xout, const float* x, const float* wp, int n, int d) {
+void matmul_simd_packed(float* xout, const float* x, const float* wp, int n, int d) {
     float32x4_t x_chunk;
 
     for (int j = 0; j < d; j += 16) {
@@ -691,9 +691,9 @@ void matmul(float* xout, const float* x, const float* w, int n, int d) {
     if (strcmp(old_matmul, "y") == 0) {
         matmul_old(xout, x, w, n, d);
     } else if (strcmp(packed_matmul, "y") == 0) {
-        matmul_packed(xout, x, w, n, d);
+        matmul_simd_packed(xout, x, w, n, d);
     } else {
-        matmul_new(xout, x, w, n, d);
+        matmul_simd(xout, x, w, n, d);
     }
 }
 
@@ -724,8 +724,8 @@ static void bench_all(int n, int d, int reps, int trials) {
     if (posix_memalign((void**)&wp, 128, (size_t)n * d * sizeof(float)) != 0) { exit(EXIT_FAILURE); }
     pack_matrix(wp, w, d, n);
 
-    const char*  labels[3] = {"old", "new", "packed"};
-    matmul_fn    fns[3]    = {matmul_old, matmul_new, matmul_packed};
+    const char*  labels[3] = {"old", "simd", "simd_packed"};
+    matmul_fn    fns[3]    = {matmul_old, matmul_simd, matmul_simd_packed};
     const float* ws[3]     = {w, w, wp};
     double       times[3][64];
 
@@ -750,7 +750,7 @@ static void bench_all(int n, int d, int reps, int trials) {
         }
         qsort(times[k], trials, sizeof(double), cmp_double);
         double best = times[k][0], med = times[k][trials / 2];
-        printf("%-7s d=%-6d best %9.0f ns (%5.1f GB/s)   median %9.0f ns (%5.1f GB/s)   max diff %.1e\n",
+        printf("%-11s d=%-6d best %9.0f ns (%5.1f GB/s)   median %9.0f ns (%5.1f GB/s)   max diff %.1e\n",
                labels[k], d, best, bytes / best, med, bytes / med, maxdiff);
     }
     printf("\n");
@@ -801,7 +801,7 @@ void matmul_test_harness() {
 
     float x_matmul[test_array_size_row];
     memset(x_matmul, 0, test_array_size_row * sizeof(float));
-    matmul_new(x_matmul, x, w, test_array_size_col, test_array_size_row);
+    matmul_simd(x_matmul, x, w, test_array_size_col, test_array_size_row);
     
     printf("== result of old matmul ==\n");
     for (int i = 0; i < test_array_size_row; i++) {
