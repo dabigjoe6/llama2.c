@@ -11,3 +11,6 @@ stories15M.bin
 
 # editor
 .vscode/
+
+# Instruments templates
+*.tracetemplate
