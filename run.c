@@ -25,7 +25,7 @@
 // introduce below, I could change data types some other time
 _Static_assert(sizeof(float) == 4, "Error: float is not 4 bytes on this target!");
 
-char *old_matmul = "";
+char *original_matmul = "";
 char *packed_matmul = "n";
 
 typedef struct {
@@ -315,7 +315,7 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul_old(float* xout, const float* x, const float* w, int n, int d) {
+void matmul_original(float* xout, const float* x, const float* w, int n, int d) {
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
@@ -688,8 +688,8 @@ void matmul_simd_packed(float* xout, const float* x, const float* wp, int n, int
 }
 
 void matmul(float* xout, const float* x, const float* w, int n, int d) {
-    if (strcmp(old_matmul, "y") == 0) {
-        matmul_old(xout, x, w, n, d);
+    if (strcmp(original_matmul, "y") == 0) {
+        matmul_original(xout, x, w, n, d);
     } else if (strcmp(packed_matmul, "y") == 0) {
         matmul_simd_packed(xout, x, w, n, d);
     } else {
@@ -724,12 +724,12 @@ static void bench_all(int n, int d, int reps, int trials) {
     if (posix_memalign((void**)&wp, 128, (size_t)n * d * sizeof(float)) != 0) { exit(EXIT_FAILURE); }
     pack_matrix(wp, w, d, n);
 
-    const char*  labels[3] = {"old", "simd", "simd_packed"};
-    matmul_fn    fns[3]    = {matmul_old, matmul_simd, matmul_simd_packed};
+    const char*  labels[3] = {"original", "simd", "simd_packed"};
+    matmul_fn    fns[3]    = {matmul_original, matmul_simd, matmul_simd_packed};
     const float* ws[3]     = {w, w, wp};
     double       times[3][64];
 
-    matmul_old(ref, x, w, n, d);                                 // reference answer
+    matmul_original(ref, x, w, n, d);                                 // reference answer
     for (int k = 0; k < 3; k++) fns[k](xout, x, ws[k], n, d);    // warm up
 
     for (int t = 0; t < trials; t++) {
@@ -795,9 +795,9 @@ void matmul_test_harness() {
     }
     printf("\n\n");
 
-    float x_matmul_old[test_array_size_row];
-    memset(x_matmul_old, 0, test_array_size_row * sizeof(float));
-    matmul_old(x_matmul_old, x, w, test_array_size_col, test_array_size_row);
+    float x_matmul_original[test_array_size_row];
+    memset(x_matmul_original, 0, test_array_size_row * sizeof(float));
+    matmul_original(x_matmul_original, x, w, test_array_size_col, test_array_size_row);
 
     float x_matmul[test_array_size_row];
     memset(x_matmul, 0, test_array_size_row * sizeof(float));
@@ -805,7 +805,7 @@ void matmul_test_harness() {
     
     printf("== result of old matmul ==\n");
     for (int i = 0; i < test_array_size_row; i++) {
-        printf("%f ", x_matmul_old[i]);
+        printf("%f ", x_matmul_original[i]);
         printf((i+1) % test_array_size_col == 0 ? "\n" : "");
     }
     printf("\n\n");
@@ -825,7 +825,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
     // weights for the matmuls: the packed copies when packing is on, otherwise the originals
-    TransformerWeights* mw = (strcmp(packed_matmul, "y") == 0 && strcmp(old_matmul, "y") != 0)
+    TransformerWeights* mw = (strcmp(packed_matmul, "y") == 0 && strcmp(original_matmul, "y") != 0)
                              ? &transformer->packed : w;
     float *x = s->x;
     int dim = p->dim;
@@ -1533,7 +1533,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
         else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
         else if (argv[i][1] == 'h') { harness = argv[i + 1]; }
-        else if (argv[i][1] == 'u') { old_matmul = argv[i + 1]; }
+        else if (argv[i][1] == 'u') { original_matmul = argv[i + 1]; }
         else if (argv[i][1] == 'k') { packed_matmul = argv[i + 1]; }
         else { error_usage(); }
     }
